@@ -9,18 +9,22 @@ from astroquery.simbad import Simbad
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 import csv
+import os
+import glob
 
 Simbad.reset_votable_fields()
 
-WISE_positions = r'C:\Users\Joe\Documents\Astro_Research_2017\ra_dec.txt' #path to file containing WISE ra and dec text file
-outputfile = r'C:\Users\Joe\Documents\Astro_Research_2017\matches.csv'    #csv file where match results written to
+WISE_positions = r'C:\Users\Joe\Documents\Astro_Research_2017\ALLWISE_RA_DEC' #path to file containing WISE ra and dec text file(s)
+outputfile = r'C:\Users\Joe\Documents\Astro_Research_2017\matches_original.csv'        #csv file where match results written to
 
-# import RA and DEC measurements from WISE text file where measurements are separated by a comma
+# loop through all RA and DEC text files in given directory
 coordinates = []
-with open(WISE_positions) as inputfile:
-    for line in inputfile:
-        coordinates.append(line.strip().split(','))
-
+path =  WISE_positions
+for infile in glob.glob( os.path.join(path, '*.txt') ):
+    # import RA and DEC measurements from WISE text file where measurements are separated by a comma
+    with open(infile) as inputfile:
+        for line in inputfile:
+            coordinates.append(line.strip().split(','))
 
 simbad_matches = []
 real_match_data = [] #contains match results only, disregards "NoneType" i.e. no match
@@ -28,8 +32,9 @@ coordinate_save = [] #corresponding ALLWISE (RA,DEC) for SIMBAD match
 i = 0
 for row in coordinates:
     coord = row # single RA and DEC measurement
+    print("COCK")
     simbad_matches.append(Simbad.query_region(SkyCoord(coord[0], coord[1], unit=(u.deg, u.deg), frame='fk5'), radius = 1*u.arcsec))
-    
+    print("COCK")
     #discard results with no matches
     if(type(simbad_matches[i]) == astropy.table.table.Table): 
         real_match_data.append(simbad_matches[i])
