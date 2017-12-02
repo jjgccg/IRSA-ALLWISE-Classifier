@@ -1,0 +1,371 @@
+# Benchmarking ML Techniques on the ALLWISE Data Release
+
+```{r}
+library(readr)
+library(plyr)
+library(ggplot2)
+library(viridis)
+library(stringi)
+library(keras)
+library(xgboost)
+```
+
+## Data Preprocessing
+
+First, I need to get the data in a format suitable for classification.
+
+```{r}
+#First dataset contains SIMBAD object names with associated RA and DEC measurements
+#Second dataset contains WISE info for each datapoint (W1, W2, W3, W4 info)
+simbad <- read.csv("C:/Users/Joe/Documents/Astro_Research_2017/SIMBAD_Matches_1 - matches.csv", header=FALSE, sep=",", stringsAsFactors=FALSE)
+allwise_info <-  read.csv("C:/Users/Joe/Documents/Astro_Research_2017/allwise_info.csv", header=FALSE, sep=",", stringsAsFactors=FALSE)
+
+#Attach simbad columns of interest to WISE info
+allwise_info$object_name <- simbad$V1
+allwise_info$ra <- simbad$V2
+allwise_info$dec <- simbad$V3
+
+allwise_dataset <- allwise_info[,c(17,18,19,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)]
+
+#Rename some columns
+allwise_dataset <- rename(allwise_dataset, c("V1"="w1mpro", "V2"="w1sigmpro", "V3"="w1snr", "V4"="w1rchi2", "V5"="w2mpro",
+                                             "V6"="w2sigmpro", "V7"="w2snr", "V8"="w2rchi2", "V9"="w3mpro", "V10"="w3sigmpro",
+                                             "V11"="w3snr", "V12"="w3rchi2", "V13"="w4mpro", "V14"="w4sigmpro", "V15"="w4snr",
+                                             "V16"="w4rchi2"))
+
+allwise_dataset$object_name <- sapply(allwise_dataset$object_name, function(x) toString(x)) #Change object names to string type to parse
+allwise_dataset$object_name <- sapply(allwise_dataset$object_name, function(x) strsplit(x, " ")[[1]][1]) #Remove integer sub-identifiers from objects
+
+#OBJECTIVE: Find highest count categories so we can get these categories only to perform analysis on
+unique(allwise_dataset$object_name) #get list of unique object identifiers
+
+#Get unique datasets comprised of TYC, HD, and UCAC2
+allwise_subset_tyc <- allwise_dataset[allwise_dataset$object_name == "TYC",]
+allwise_subset_hd <- allwise_dataset[allwise_dataset$object_name == "HD",]
+allwise_subset_ucac2 <- allwise_dataset[allwise_dataset$object_name == "UCAC2",]
+
+#UPSAMPLING: Sample with replacement to get equal number of HD and UCAC2 as TYC
+hd_sample <- allwise_subset_hd[sample(nrow(allwise_subset_hd), replace = TRUE, 7407), ]
+ucac2_sample <- allwise_subset_ucac2[sample(nrow(allwise_subset_ucac2), replace = TRUE, 7407), ]
+#Create new dataset by stacking TYC, HD, and UCAC2 on top of each other
+bind1 <- rbind(allwise_subset_tyc, hd_sample)
+allwise_subset <- rbind(bind1, ucac2_sample)
+allwise_subset <- allwise_subset[sample(1:nrow(allwise_subset)),] #shuffle this new dataset
+
+#Add training, test, and validation labels to the dataaset
+coff <- runif(nrow(allwise_subset))
+allwise_subset$train_id <- "valid"
+allwise_subset$train_id[coff < .6] <- "train"
+allwise_subset$train_id[coff > .8] <- "test"
+
+#We now have a table with labels - save as CSV file
+write.csv(allwise_subset, "C:/Users/Joe/Documents/Astro_Research_2017/allwise_subset.csv")
+```
+
+
+## Graphical Exploration
+
+Let's first start out by visualizing the locations of the data in terms of their RA and DEc measurements.  The plot is color coded to indicate the three classes of stars I'm working with.  These give an idea of the bands of RA and DEC that I sampled from in order to get my data. (also insert the galactic plane)
+
+```{r}
+qplot(ra, dec, data=allwise_subset, color = factor(object_name), main = "Visualization of Stars in RA and DEC Space", ylab = "Declination", xlab = "Right Ascension")
+```
+
+I'm interested in taking a look at the relationship between the flux measurements for all four bands as well as their associated signal to noise ratios.
+
+```{r}
+qplot(w1mpro, w1snr, data=allwise_subset, color = factor(object_name), main = "W1 Magnitude vs. W1 SNR")
+```
+```{r}
+qplot(w2mpro, w2snr, data=allwise_subset, color = factor(object_name), main = "W2 Magnitude vs. W2 SNR")
+```
+```{r}
+qplot(w3mpro, w3snr, data=allwise_subset, color = factor(object_name), main = "W3 Magnitude vs. W3 SNR")
+```
+```{r}
+qplot(w4mpro, w4snr, data=allwise_subset, color = factor(object_name), main = "W4 Magnitude vs. W4 SNR")
+```
+
+This is actually pretty interesting!  The w1 and w2 bands have very similar shapes.  That is, they slope upwards and sort of level off.  With these two, there seems to be a very general pattern (with several outliers, of course), that the higher the flux magnitude, the higher the signal-to-noise ratio.  The stars from the HD catalog also seem to comprise a greater amount of the stars with lower flux measurements.
+
+The W3 and W4 bands also share a similar shape, where all of the stars are sort of clumped together in the same space.
+
+## Model Regularization
+
+### Working with NA Values
+
+This dataset certainly has some missing values in it, which will not work with ridge/lasso regression.  The values that are missing are indicated as "--".  Let's first make all of these values into NA values instead, so it's easier to work with them.
+
+```{r}
+allwise_subset[allwise_subset == "--"] <- NA
+```
+
+Now, let's get a count of all of the NA values per row.
+
+```{r}
+for(i in colnames(allwise_subset))
+{
+  if(i != "object_name" && i != "train_id")
+  {
+    print(i)
+    print(sum(is.na(allwise_subset[,i]))) 
+  }
+}
+```
+
+It turns out that the only columns which are missing values are the "sigmpro" ones.  "w4sigmpro" is missing a huge amount of data values, so we had better just scrap this one.  For the other three, we can just replace the missing values by the mean value of the given column, which will give us a decent approximation.
+
+```{r}
+allwise_subset$w4sigmpro <- NULL #delete
+
+#convert the columns to numeric.  they are currently character
+allwise_subset$w3sigmpro <- as.numeric(allwise_subset$w3sigmpro)
+allwise_subset$w2sigmpro <- as.numeric(allwise_subset$w2sigmpro)
+allwise_subset$w1sigmpro <- as.numeric(allwise_subset$w1sigmpro)
+
+#replace NA values with mean for each row
+allwise_subset$w3sigmpro[is.na(allwise_subset$w3sigmpro)] <- mean(allwise_subset$w3sigmpro, na.rm = TRUE)
+allwise_subset$w2sigmpro[is.na(allwise_subset$w2sigmpro)] <- mean(allwise_subset$w2sigmpro, na.rm = TRUE)
+allwise_subset$w1sigmpro[is.na(allwise_subset$w1sigmpro)] <- mean(allwise_subset$w2sigmpro, na.rm = TRUE)
+```
+
+
+### Ridge and Lasso Regression
+
+I'm working with quite a few variables here, and I'm not entirely sure what all of the variables mean at an in-depth level.  Let's use ridge regression to get a better understanding of the relationship between the column variables and the three different classes of stars.
+
+We start by putting the model into matrix form.
+```{r}
+library(glmnet)
+
+#first, make a column of numerical values representing classes
+allwise_subset$sclass <- factor(allwise_subset$object_name, labels=(1:length(levels(factor(allwise_subset$object_name)))))
+allwise_subset$sclass <- as.numeric(allwise_subset$sclass)
+
+X <- as.matrix(allwise_subset[,4:18])
+y <- allwise_subset$sclass
+```
+
+
+Now we can perform regularization via glmnet.  I will set alpha = .9.
+```{r}
+model <- cv.glmnet(X, y, alpha = .9)
+coef(model)
+```
+
+From this preliminary analysis, it looks like w1mpro and w2sigmpro are highly negatively correlated with the star class, while w1sigmpro and w2mpro are positively correlated.  The rest of the variables are slightly positively or negatively correlated.  This will be good to know for future models, as we do not want to introduce noise into the model by supplying useless variables.
+
+## Tree-Based Model with xgboost
+
+
+```{r}
+library(xgboost)
+```
+
+Our first model for this dataset will be a tree based model using xgboost.
+
+We first start by creating relevant X and y training data to put into the model.
+```{r}
+X <- model.matrix(~ . - 1, data = allwise_subset[,4:18])
+y <- allwise_subset$sclass
+
+X_train <- X[allwise_subset$train_id == "train",]
+y_train <- y[allwise_subset$train_id == "train"]
+X_valid <- X[allwise_subset$train_id == "valid",]
+y_valid <- y[allwise_subset$train_id == "valid"]
+
+data_train <- xgb.DMatrix(data = X_train, label = y_train)
+data_valid <- xgb.DMatrix(data = X_valid, label = y_valid)
+watchlist <- list(train=data_train, valid=data_valid)
+```
+
+Now we can create the model.  We are trying to predict 3 classes here so we set our objective equal to "multi:softmax".  The maximum depth of the tree has been set to 3 to avoid any drastic overfitting.  Using a depth of 2, however, resulted in a worse training and validation rate.  An eta value of .5 seems to work the best for this particular case, and 1000 rounds seems to be ideal, at least for the validation rate.
+
+```{r}
+model <- xgb.train(data = data_train,
+                   max_depth = 3, eta = 0.4, nthread = 4,
+                   nrounds = 1000, objective = "multi:softmax",
+                   num_class = 4, watchlist = watchlist,
+                   print_every_n = 100)
+```
+
+```{r}
+allwise_subset$object_pred <- predict(model, newdata = X)
+tapply(allwise_subset$object_pred == allwise_subset$sclass,
+       allwise_subset$train_id, mean)
+
+```
+
+This has given very good results, although it looks like the model is a little bit overfit based on the 100% training rate.  A 94% testing rate is not bad at all, though.
+
+TREE FINAL TESTING: ~94%
+
+## Multinomial Logistic Regression
+
+Since we are trying to place the stars into three categories, it would not make sense to use the classic linear regression model.  However, we can use the nnet package and the multinom function to perform multinomial logistic regression.
+
+Let's play around with using different variables as predictors.  
+Recall that w1mpro, w1sigmpro, w2mpro, and w2sigmpro had the highest values in the glmnet regularization performed earlier.
+
+Let's create a model with just these variables and then a model with all of the possible variables and see how they differ.
+
+```{r}
+library(nnet)
+model <- multinom(sclass ~ poly(w1mpro, w1sigmpro, w2mpro, w2sigmpro, degree = 3), data = allwise_subset)
+
+allwise_subset$object_pred <- predict(model, newdata = allwise_subset)
+tapply(allwise_subset$object_pred == allwise_subset$sclass, allwise_subset$train_id, mean)
+```
+
+Interestingly enough, a third degree polynomial seems to work best with this data.  The validation rate is nowhere near as good as the gradient boosted tree.  Let's try predicting the classes with all of the columns in the dataset now.
+
+```{r}
+model <- multinom(sclass ~ poly(w1mpro, w1sigmpro, w1snr, w1rchi2, w2mpro, w2sigmpro, w2snr, w2rchi2, w3mpro, w3sigmpro, w3rchi2, w4mpro, w4snr, degree = 3), data = allwise_subset, MaxNWts = 1683)
+
+allwise_subset$object_pred <- predict(model, newdata = allwise_subset)
+tapply(allwise_subset$object_pred == allwise_subset$sclass, allwise_subset$train_id, mean)
+```
+
+This is very interesting.  As stated earlier in the model regularization dataset, only a few key variables were highly correlated with the classes the stars fell into.  This is why including all possible variables in the model leads to a tiny increase in the validation rate.
+
+As we wrap this section up, it may prove to be interesting to see which classes the model is mixing up through a confusion matrix.
+
+```{r}
+table(y = allwise_subset$sclass, y_pred = allwise_subset$object_pred)
+```
+
+MULTINOMIAL REGRESSION FINAL TESTING: ~69%
+
+## Support Vector Machine
+
+
+## K-Nearest Neighbors
+
+The k-nearest neighbors approach categorizes each point with whatever category is more prominent within the nearest k-training points.
+
+Let's see how well this performs with star data.
+
+First, we have to create a model matrix to use with FNN.
+
+```{r}
+library(FNN)
+
+X <- as.matrix(allwise_subset[,4:18])
+y <- allwise_subset$sclass
+X_train <- X[allwise_subset$train_id == "train",]
+y_train <- y[allwise_subset$train_id == "train"]
+```
+
+Now we can use the knn function to run the nearest neighbors algorithm.
+
+```{r}
+allwise_subset$object_pred <- knn(train = X_train, test = X,
+                     cl = y_train, k = 2)
+tapply(allwise_subset$object_pred == allwise_subset$sclass, allwise_subset$train_id, mean)
+```
+
+I experimented with playing around with the k parameter.  Very high values of k led to a worse validation rate.  K being set equal to 2 seems to yield the best validation rate while not overfitting.  Overall, the knn model performs quite well when compared with other models such as multinomial regression.
+
+To confirm that we have the optimal value of k, let's fit the knn algorithm for 25 values of k, from 1 to 25.  As we can see, a k somewhere near 1 or 2 yields the lowest RMSE score, so k=2 seems like a good choice here.
+
+```{r}
+rmse <- rep(NA, 25)
+for (k in seq_along(rmse)) {
+  y_valid_pred <- knn.reg(train = X_train, y = y_train,
+                          test = X_valid, k = k)$pred
+  rmse[k] <- sqrt( mean((y_valid_pred - y_valid)^2) )
+}
+
+qplot(seq_along(rmse), rmse) +
+  geom_line() +
+  theme_minimal()
+```
+
+It's interesting to note that k is inversely related to the complexity of the model.  such a small k must mean that the model is pretty complex.
+
+KNN FINAL TESTING: ~88%
+
+## Elastic Net
+
+The Elastic Net is a regularized regression method that solves the limitations of both lasso and ridge regression.  Let's use the glmnet package in R to create an elastic net model for our predictions here.
+
+We start out by creating our training data structures.
+
+```{r}
+X <- as.matrix(allwise_subset[,4:18])
+y <- allwise_subset$sclass
+X_train <- X[allwise_subset$train_id == "train",]
+y_train <- y[allwise_subset$train_id == "train"]
+```
+
+Now we can use glmnet to create the model and make predictions with it.  I'm opting to leave the lambda argument as the default value.
+
+```{r}
+model <- cv.glmnet(X_train, y_train, family = "multinomial")
+allwise_subset$object_pred <- predict(model, newx = X, type="class", alpha=.2)
+
+tapply(allwise_subset$object_pred == allwise_subset$sclass, allwise_subset$train_id, mean)
+```
+
+The elastic net performed about as good as the multinomial regression, i.e. not very well.  Furthermore, it took a long time to run, making it not an ideal choice for using in this ALLWISE star dataset.
+
+ELASTIC NET FINAL TESTING: ~67%
+
+## Neural Networks with Keras
+
+Neural networks seem to be popular with the cool CS kids these days. Unfortunately, neural networks did not work too well for classifying this dataset. I've had much more success in the past with using neural networks for text and image classification.
+
+Let's create the training data, making sure to specify the number of classes as 3.
+
+```{r}
+X <- as.matrix(allwise_subset[,4:18])
+y <- allwise_subset$sclass - 1
+X_train <- X[allwise_subset$train_id == "train",]
+y_train <- to_categorical(y[allwise_subset$train_id == "train"], num_classes = 3)
+```
+
+Now comes the fun part. Getting good neural network prediction results is largely based on experimentation with different numbers of layers, neurons, and other various techniques. I know that my dataset is relatively small, so using more than a single layer will not yield good results. I even tried it. There is also no need for fancy neural networks such as convolutional or recurrent.
+
+Let's settle for a model with the following characteristics (after performing some fine-tuning):
+- a dense network with 128 neurons in the primary layer
+- "selu" ("relu" gave slightly worse results) and "softmax" layer activations
+- learning rate of 0.00005
+
+It seems that a smaller learning rate generally provides better results up to a point.  Additionally, 10 epochs seems to be an ideal number - anything lower and we start getting drops in the testing value.  The neural network certainly "levels out" in its learning of the dataset - for example, 20 epochs really doesn't have much effect with respect to the classification rate.
+
+```{r}
+model <- keras_model_sequential()
+model %>%
+
+  layer_dense(units = 128, 
+              input_shape = c(15)) %>%
+  layer_activation(activation = "selu") %>%
+  layer_dropout(rate = 0.5) %>%
+
+  layer_dense(units = 3) %>%
+  layer_activation(activation = "softmax")
+
+model %>% compile(loss = 'categorical_crossentropy',
+                  optimizer = optimizer_sgd(lr = 0.00005, momentum = .9,
+                                            nesterov = TRUE),
+                  metrics = c('accuracy'))
+
+history <- model %>%
+  fit(X_train, y_train, epochs = 10, validation_split = 0.2)
+```
+
+Despite trying to fine tune the neural network, we end up with classifications rates that aren't exactly remarkable. This is okay - my data is simply not designed for predictions using a neural network.
+
+```{r}
+allwise_subset$object_pred <- predict_classes(model,X) + 1
+tapply(allwise_subset$object_pred == allwise_subset$sclass, allwise_subset$train_id, mean)
+```
+
+
+
+
+
+
+
+
+

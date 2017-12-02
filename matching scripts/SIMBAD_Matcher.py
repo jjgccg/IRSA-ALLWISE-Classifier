@@ -32,9 +32,7 @@ coordinate_save = [] #corresponding ALLWISE (RA,DEC) for SIMBAD match
 i = 0
 for row in coordinates:
     coord = row # single RA and DEC measurement
-    print("COCK")
     simbad_matches.append(Simbad.query_region(SkyCoord(coord[0], coord[1], unit=(u.deg, u.deg), frame='fk5'), radius = 1*u.arcsec))
-    print("COCK")
     #discard results with no matches
     if(type(simbad_matches[i]) == astropy.table.table.Table): 
         real_match_data.append(simbad_matches[i])
