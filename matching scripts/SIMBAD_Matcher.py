@@ -29,19 +29,21 @@ for infile in glob.glob( os.path.join(path, '*.txt') ):
 simbad_matches = []
 real_match_data = [] #contains match results only, disregards "NoneType" i.e. no match
 coordinate_save = [] #corresponding ALLWISE (RA,DEC) for SIMBAD match
-i = 0
+i = 0 #keeps track of index we want
 for row in coordinates:
     coord = row # single RA and DEC measurement
     simbad_matches.append(Simbad.query_region(SkyCoord(coord[0], coord[1], unit=(u.deg, u.deg), frame='fk5'), radius = 1*u.arcsec))
+    
     #discard results with no matches
     if(type(simbad_matches[i]) == astropy.table.table.Table): 
         real_match_data.append(simbad_matches[i])
         coordinate_save.append(coord) # save coordinates for future
+    
     i+=1
 
 #get only MAIN_ID, RA, and DEC from SIMBAD matches and store it in id_ra_dec list
-j = 0
 id_ra_dec = []
+j = 0
 for table_result in real_match_data:
     temp = []
     decoded_id = table_result['MAIN_ID', 'RA', 'DEC'].as_array()[0][0].decode() #decode SIMBAD ID from byte type to string
